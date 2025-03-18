@@ -1,0 +1,45 @@
+# Byte-compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+
+# IDE configurations
+.idea/
+.vscode/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Cursor settings
+.cursorrules
+.cursor/
+
+# Pytest Cache
+.pytest_cache/
+
+# Pytest Cache
+.pytest_cache/
+
+# Metrics and Profile logs
+metrics_logs/
+profiling_results/
+
+# Backup files
+*.bak
+backup/
+
+# Temporary files
+*.tmp
+
+# Ray Temporary files
+ray_temp/
+
+# DVC
+/config.local
+/tmp
+/cache
+

@@ -1,0 +1,1245 @@
+# ./src/re_learning/q_learning.py
+
+import numpy as np
+import asyncio
+import threading
+import time
+import random
+import logging
+import copy
+from enum import Enum
+from typing import Optional, List, Any, Tuple, Dict, Set, Union
+from dataclasses import dataclass, field
+from queue import Queue
+from collections import deque
+import concurrent.futures
+from numba import njit, prange
+from pydantic import BaseModel, Field, root_validator
+from pathfinder import AStarPathfinder, PathfinderConfig, PathfinderMetrics
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class CacheStorage(str, Enum):
+    """
+    Enumeration for available storage backends for the Q-table.
+    """
+    REDIS = "redis"
+    MEMORY = "memory"
+
+class PersistentStorage(str, Enum):
+    """
+    Enumeration for available persistent storage backends for the Q-table.
+    """
+    SQLITE = "sqlite"
+    MONGO = "mongo"
+
+class QLearningConfig(BaseModel):
+    """
+    Base configuration class for the Q-Learning agent.
+    Encapsulates all configurations related to the Q-Learning algorithm.
+    """
+    alpha: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=1.0,
+        description="Learning rate for Q-Learning updates."
+    )
+    gamma: float = Field(
+        default=0.99,
+        ge=0.0,
+        le=1.0,
+        description="Discount factor for future rewards."
+    )
+    epsilon: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Initial exploration rate for epsilon-greedy strategy."
+    )
+    epsilon_min: float = Field(
+        default=0.01,
+        ge=0.0,
+        le=1.0,
+        description="Minimum exploration rate."
+    )
+    epsilon_decay: float = Field(
+        default=0.995,
+        ge=0.0,
+        le=1.0,
+        description="Decay rate for exploration probability."
+    )
+    episodes: int = Field(
+        default=1000,
+        ge=1,
+        description="Total number of training episodes."
+    )
+    max_steps: int = Field(
+        default=100,
+        ge=1,
+        description="Maximum steps per episode."
+    )
+    learning_rate_decay: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Decay rate for the learning rate alpha."
+    )
+    replay_buffer_size: int = Field(
+        default=10000,
+        ge=1,
+        description="Maximum size of the experience replay buffer."
+    )
+    batch_size: int = Field(
+        default=64,
+        ge=1,
+        description="Number of experiences sampled from the replay buffer for training."
+    )
+    heuristic_update_frequency: int = Field(
+        default=50,
+        ge=1,
+        description="Frequency (in episodes) to perform heuristic-based updates."
+    )
+    heuristic_update_weight: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Weight factor for heuristic-based Q-table updates."
+    )
+    exploration_strategy: str = Field(
+        default="epsilon_greedy",
+        description="Exploration strategy to use (e.g., 'epsilon_greedy', 'softmax')."
+    )
+    cache_storage: CacheStorage = Field(
+        default=CacheStorage.REDIS,
+        description="Cache storage for the Q-table ('redis' or 'memory')."
+    )
+    persistent_storage: PersistentStorage = Field(
+        default=PersistentStorage.MONGO,
+        description="Persistent storage for the Q-table ('sqlite' or 'mongo')."
+    )
+    # Additional configuration parameters can be added here as needed.
+
+class QLearningParams(QLearningConfig):
+    """
+    Extended configuration class for the Q-Learning agent.
+    Includes initial hyperparameters that Optuna will adjust.
+    """
+    state_space: Tuple[int, int] = Field(
+        default=(10, 10),
+        description="Dimensions of the state space (e.g., grid size)."
+    )
+    action_space: int = Field(
+        default=4,
+        description="Number of possible actions."
+    )
+    # Additional initial hyperparameters for Optuna can be added here as needed.
+
+class Experience(BaseModel):
+    """Experience tuple for replay buffer."""
+    state: Tuple[int, int]
+    action: int
+    reward: float
+    next_state: Tuple[int, int]
+    done: bool
+    
+    class Config:
+        arbitrary_types_allowed = True
+
+class AgentConfig(BaseModel):
+    """Configuration for an individual agent."""
+    agent_id: str
+    q_learning_config: QLearningParams
+    subtask_domain: List[Tuple[int, int]] = Field(
+        default=[],
+        description="State space subset this agent is responsible for"
+    )
+    communication_frequency: int = Field(
+        default=5,
+        description="Frequency of communication with other agents (in episodes)"
+    )
+    temperature: float = Field(
+        default=1.0,
+        description="Temperature parameter for softmax action selection"
+    )
+    use_double_q: bool = Field(
+        default=True,
+        description="Whether to use double Q-learning"
+    )
+    target_update_frequency: int = Field(
+        default=100,
+        description="Frequency of target network updates (in episodes)"
+    )
+    heuristic_weight: float = Field(
+        default=0.5,
+        description="Weight for heuristic-guided exploration"
+    )
+
+class HierarchicalAgentSystemConfig(BaseModel):
+    """Configuration for the entire hierarchical agent system."""
+    agents_config: List[AgentConfig]
+    grid_size: Tuple[int, int] = Field(
+        default=(100, 100),
+        description="Size of the grid world"
+    )
+    action_space: int = Field(
+        default=8,
+        description="Number of possible actions (4 or 8 for grid world)"
+    )
+    pathfinder_config: Optional[PathfinderConfig] = None
+    max_communication_threads: int = Field(
+        default=4,
+        description="Maximum number of threads for agent communication"
+    )
+    max_learning_threads: int = Field(
+        default=4,
+        description="Maximum number of threads for parallel learning"
+    )
+    experience_sharing_threshold: float = Field(
+        default=0.5,
+        description="Minimum reward threshold for sharing experiences"
+    )
+    coordination_frequency: int = Field(
+        default=20,
+        description="Frequency of coordination between agents (in episodes)"
+    )
+    
+    @root_validator
+    def validate_agent_configs(cls, values):
+        """Validate that agent configurations are consistent with the system configuration."""
+        if 'agents_config' in values and 'grid_size' in values and 'action_space' in values:
+            for agent_config in values['agents_config']:
+                if agent_config.q_learning_config.state_space != values['grid_size']:
+                    agent_config.q_learning_config.state_space = values['grid_size']
+                if agent_config.q_learning_config.action_space != values['action_space']:
+                    agent_config.q_learning_config.action_space = values['action_space']
+        return values
+
+@njit
+def calculate_td_error(q_val: float, next_q_val: float, reward: float, gamma: float) -> float:
+    """
+    Calculate TD error using Numba optimization.
+    """
+    return reward + gamma * next_q_val - q_val
+
+@njit
+def update_q_value(q_val: float, td_error: float, alpha: float) -> float:
+    """Update Q-value using Numba optimization."""
+    return q_val + alpha * td_error
+
+@njit(parallel=True)
+def batch_update_q_values(q_array: np.ndarray, states: np.ndarray, actions: np.ndarray, 
+                          rewards: np.ndarray, next_states: np.ndarray, next_actions: np.ndarray, 
+                          dones: np.ndarray, alpha: float, gamma: float) -> np.ndarray:
+    """Perform batch updates on Q-values using Numba parallel optimization."""
+    result = np.copy(q_array)
+    for i in prange(len(states)):
+        if dones[i]:
+            target = rewards[i]
+        else:
+            target = rewards[i] + gamma * q_array[next_states[i][0], next_states[i][1], next_actions[i]]
+        
+        td_error = target - q_array[states[i][0], states[i][1], actions[i]]
+        result[states[i][0], states[i][1], actions[i]] += alpha * td_error
+    
+    return result
+
+@njit
+def epsilon_greedy_action(q_values: np.ndarray, epsilon: float) -> int:
+    """Select action using epsilon-greedy strategy with Numba optimization."""
+    if np.random.random() < epsilon:
+        return np.random.randint(0, len(q_values))
+    else:
+        return np.argmax(q_values)
+
+@njit
+def softmax_action(q_values: np.ndarray, temperature: float) -> int:
+    """Select action using softmax strategy with Numba optimization."""
+    # Normalize Q-values to prevent overflow
+    q_values = q_values - np.max(q_values)
+    exp_q = np.exp(q_values / temperature)
+    probs = exp_q / np.sum(exp_q)
+    return np.random.choice(len(q_values), p=probs)
+
+class ExperienceBuffer:
+    """Thread-safe experience replay buffer."""
+    def __init__(self, max_size: int = 10000):
+        self.buffer = deque(maxlen=max_size)
+        self._lock = threading.RLock()
+    
+    def add(self, experience: Experience):
+        """Add experience to buffer."""
+        with self._lock:
+            self.buffer.append(experience)
+    
+    def sample(self, batch_size: int) -> List[Experience]:
+        """Sample a batch of experiences."""
+        with self._lock:
+            return random.sample(list(self.buffer), min(batch_size, len(self.buffer)))
+    
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self.buffer)
+
+class QAgent:
+    """
+    Individual agent implementing double Q-learning and responsible for a specific subtask.
+    """
+    def __init__(self, config: AgentConfig, system_config: HierarchicalAgentSystemConfig):
+        self.config = config
+        self.system_config = system_config
+        self.id = config.agent_id
+        
+        # Initialize Q-tables
+        self.q_table = np.zeros((system_config.grid_size[0], system_config.grid_size[1], 
+                                system_config.action_space), dtype=np.float32)
+        self.target_q_table = np.zeros_like(self.q_table)  # Target network for double Q-learning
+        
+        # Initialize experience buffer
+        self.experience_buffer = ExperienceBuffer(
+            max_size=config.q_learning_config.replay_buffer_size
+        )
+        
+        # Set up communication channels
+        self.message_queue = Queue()
+        self.experiences_to_share = Queue()
+        
+        # Learning parameters
+        self.alpha = config.q_learning_config.alpha
+        self.gamma = config.q_learning_config.gamma
+        self.epsilon = config.q_learning_config.epsilon
+        self.epsilon_min = config.q_learning_config.epsilon_min
+        self.epsilon_decay = config.q_learning_config.epsilon_decay
+        
+        # Setup thread locks
+        self._q_lock = threading.RLock()
+        self._param_lock = threading.RLock()
+        self._episode_counter = 0
+        self._step_counter = 0
+        
+        logger.info(f"Agent {self.id} initialized with subtask domain: {config.subtask_domain}")
+    
+    def select_action(self, state: Tuple[int, int]) -> int:
+        """
+        Select an action using the specified exploration strategy.
+        """
+        with self._q_lock:
+            q_values = self.q_table[state[0], state[1], :]
+        
+        if self.config.q_learning_config.exploration_strategy == "epsilon_greedy":
+            return epsilon_greedy_action(q_values, self.epsilon)
+        elif self.config.q_learning_config.exploration_strategy == "softmax":
+            return softmax_action(q_values, self.config.temperature)
+        else:
+            # Default to epsilon-greedy
+            return epsilon_greedy_action(q_values, self.epsilon)
+    
+    def update_q(self, experience: Experience):
+        """
+        Update Q-values using double Q-learning.
+        """
+        state, action, reward, next_state, done = (
+            experience.state, experience.action, experience.reward, 
+            experience.next_state, experience.done
+        )
+        
+        with self._q_lock:
+            if self.config.use_double_q:
+                # Double Q-learning: use primary network to select action, target network to evaluate
+                next_action = np.argmax(self.q_table[next_state[0], next_state[1], :])
+                next_q_val = self.target_q_table[next_state[0], next_state[1], next_action]
+            else:
+                # Standard Q-learning
+                next_q_val = np.max(self.q_table[next_state[0], next_state[1], :])
+            
+            current_q = self.q_table[state[0], state[1], action]
+            
+            if done:
+                target = reward
+            else:
+                target = reward + self.gamma * next_q_val
+            
+            td_error = target - current_q
+            self.q_table[state[0], state[1], action] += self.alpha * td_error
+    
+    def process_experiences(self, experiences: List[Experience]):
+        """
+        Process a batch of experiences for Q-learning updates.
+        """
+        if not experiences:
+            return
+        
+        # Add experiences to buffer
+        for exp in experiences:
+            self.experience_buffer.add(exp)
+        
+        # Sample a batch if buffer is large enough
+        if len(self.experience_buffer) >= self.config.q_learning_config.batch_size:
+            self._batch_update()
+    
+    def _batch_update(self):
+        """
+        Perform batch updates on Q-values using experiences from the buffer.
+        """
+        batch = self.experience_buffer.sample(self.config.q_learning_config.batch_size)
+        
+        # Prepare arrays for batch update
+        states = np.array([exp.state for exp in batch])
+        actions = np.array([exp.action for exp in batch])
+        rewards = np.array([exp.reward for exp in batch])
+        next_states = np.array([exp.next_state for exp in batch])
+        dones = np.array([exp.done for exp in batch], dtype=bool)
+        
+        with self._q_lock:
+            if self.config.use_double_q:
+                # Double Q-learning batch update
+                next_actions = np.array([np.argmax(self.q_table[ns[0], ns[1], :]) for ns in next_states])
+                self.q_table = batch_update_q_values(
+                    self.q_table, states, actions, rewards, 
+                    next_states, next_actions, dones, self.alpha, self.gamma
+                )
+            else:
+                # Standard Q-learning batch update
+                next_q_vals = np.array([np.max(self.q_table[ns[0], ns[1], :]) for ns in next_states])
+                for i, (state, action, reward, next_state, done) in enumerate(zip(states, actions, rewards, next_states, dones)):
+                    if done:
+                        target = reward
+                    else:
+                        target = reward + self.gamma * next_q_vals[i]
+                    
+                    self.q_table[state[0], state[1], action] += self.alpha * (target - self.q_table[state[0], state[1], action])
+    
+    def update_target_network(self):
+        """
+        Update the target network with the current Q-table values.
+        """
+        with self._q_lock:
+            self.target_q_table = np.copy(self.q_table)
+    
+    def decay_epsilon(self):
+        """
+        Decay the exploration rate.
+        """
+        with self._param_lock:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+    
+    def receive_message(self, message: Dict[str, Any]):
+        """
+        Process a message from another agent.
+        """
+        self.message_queue.put(message)
+    
+    def process_messages(self):
+        """
+        Process all messages in the message queue.
+        """
+        while not self.message_queue.empty():
+            message = self.message_queue.get()
+            message_type = message.get('type')
+            
+            if message_type == 'q_values':
+                self._process_q_values_message(message)
+            elif message_type == 'experience':
+                self._process_experience_message(message)
+            elif message_type == 'coordination':
+                self._process_coordination_message(message)
+    
+    def _process_q_values_message(self, message: Dict[str, Any]):
+        """
+        Process a message containing Q-values from another agent.
+        """
+        sender_id = message.get('sender_id')
+        q_values = message.get('q_values')
+        states = message.get('states')
+        
+        with self._q_lock:
+            for state, q_vals in zip(states, q_values):
+                # Only update if the state is in our domain
+                if self._is_in_domain(state):
+                    # Weighted average of our Q-values and received Q-values
+                    weight = self.config.heuristic_weight
+                    for action, q_val in enumerate(q_vals):
+                        self.q_table[state[0], state[1], action] = (
+                            (1 - weight) * self.q_table[state[0], state[1], action] + 
+                            weight * q_val
+                        )
+    
+    def _process_experience_message(self, message: Dict[str, Any]):
+        """
+        Process a message containing shared experiences from another agent.
+        """
+        sender_id = message.get('sender_id')
+        experiences = message.get('experiences')
+        
+        # Filter experiences that are in our domain
+        relevant_experiences = [
+            Experience(**exp) for exp in experiences 
+            if self._is_in_domain(exp['state']) or self._is_in_domain(exp['next_state'])
+        ]
+        
+        self.process_experiences(relevant_experiences)
+    
+    def _process_coordination_message(self, message: Dict[str, Any]):
+        """
+        Process a coordination message from another agent or the coordinator.
+        """
+        coordination_type = message
+
+def _process_coordination_message(self, message: Dict[str, Any]):
+    """
+    Process a coordination message from another agent or the coordinator.
+    """
+    coordination_type = message.get('coordination_type')
+    
+    if coordination_type == 'task_reassignment':
+        # Update subtask domain
+        new_domain = message.get('new_domain')
+        if new_domain:
+            self.config.subtask_domain = new_domain
+            logger.info(f"Agent {self.id} domain reassigned to: {new_domain}")
+    elif coordination_type == 'parameter_adjustment':
+        # Update learning parameters
+        params = message.get('parameters', {})
+        with self._param_lock:
+            for param, value in params.items():
+                if hasattr(self, param):
+                    setattr(self, param, value)
+                    logger.info(f"Agent {self.id} updated parameter {param} to {value}")
+    
+    def share_experiences(self) -> List[Dict]:
+        """
+        Share valuable experiences with other agents.
+        Returns experiences as serializable dictionaries.
+        """
+        if len(self.experience_buffer) < self.config.q_learning_config.batch_size:
+            return []
+        
+        # Sample high-reward experiences to share
+        experiences = self.experience_buffer.sample(self.config.q_learning_config.batch_size // 2)
+        threshold = self.system_config.experience_sharing_threshold
+        
+        # Filter experiences with rewards above threshold
+        valuable_experiences = [exp for exp in experiences if exp.reward > threshold]
+        
+        # Convert to dictionaries for sharing
+        return [exp.dict() for exp in valuable_experiences]
+    
+    def share_q_values(self, states: List[Tuple[int, int]]) -> Dict[str, Any]:
+        """
+        Share Q-values for specific states with other agents.
+        """
+        q_values = []
+        with self._q_lock:
+            for state in states:
+                if self._is_in_domain(state):
+                    q_values.append(self.q_table[state[0], state[1], :].tolist())
+        
+        return {
+            'sender_id': self.id,
+            'type': 'q_values',
+            'states': states,
+            'q_values': q_values
+        }
+    
+    def _is_in_domain(self, state: Tuple[int, int]) -> bool:
+        """
+        Check if a state is in this agent's domain.
+        """
+        if not self.config.subtask_domain:
+            return True  # If no domain specified, consider all states in domain
+        
+        return state in self.config.subtask_domain
+    
+    def incorporate_pathfinder_data(self, path: List[Tuple[int, int]], goal: Tuple[int, int], reward: float):
+        """
+        Incorporate path data from A* pathfinding to guide Q-learning.
+        """
+        if not path or len(path) < 2:
+            return
+        
+        # Create synthetic experiences from the path
+        for i in range(len(path) - 1):
+            current = path[i]
+            next_state = path[i + 1]
+            
+            # Determine action that led from current to next_state
+            dx = next_state[0] - current[0]
+            dy = next_state[1] - current[1]
+            
+            # Map (dx, dy) to action index based on DIRECTIONS_8 from pathfinder
+            # [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)]
+            actions_map = {
+                (1, 0): 0, (-1, 0): 1, (0, 1): 2, (0, -1): 3,
+                (1, 1): 4, (1, -1): 5, (-1, 1): 6, (-1, -1): 7
+            }
+            
+            action = actions_map.get((dx, dy), 0)
+            
+            # Calculate immediate reward (higher for closer to goal)
+            done = (next_state == goal)
+            immediate_reward = reward / len(path) if not done else reward
+            
+            # Create and add experience
+            exp = Experience(
+                state=current,
+                action=action,
+                reward=immediate_reward,
+                next_state=next_state,
+                done=done
+            )
+            
+            self.experience_buffer.add(exp)
+    
+    def track_episode(self):
+        """
+        Track episode progress and trigger periodic actions.
+        """
+        with self._param_lock:
+            self._episode_counter += 1
+            
+            # Decay epsilon
+            self.decay_epsilon()
+            
+            # Update target network periodically
+            if self.config.use_double_q and self._episode_counter % self.config.target_update_frequency == 0:
+                self.update_target_network()
+
+class HierarchicalAgentSystem:
+    """
+    Manages a system of hierarchical agents that work together to solve complex tasks.
+    """
+    def __init__(self, config: HierarchicalAgentSystemConfig):
+        self.config = config
+        self.agents = {}
+        
+        # Initialize agents
+        for agent_config in config.agents_config:
+            self.agents[agent_config.agent_id] = QAgent(agent_config, config)
+        
+        # Initialize pathfinder
+        self.pathfinder_config = config.pathfinder_config or PathfinderConfig(
+            grid_size=config.grid_size,
+            allow_diagonal=(config.action_space == 8)
+        )
+        
+        # Communication and coordination
+        self._thread_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=config.max_communication_threads
+        )
+        self._learning_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=config.max_learning_threads
+        )
+        
+        # System state tracking
+        self._episode_counter = 0
+        self._system_lock = threading.RLock()
+        
+        # Create domain partitioning if not specified
+        self._ensure_domain_partitioning()
+        
+        logger.info(f"Hierarchical Agent System initialized with {len(self.agents)} agents")
+    
+    def _ensure_domain_partitioning(self):
+        """
+        Ensure that each agent has a defined domain by partitioning the state space.
+        """
+        # Check if domains are already assigned
+        all_assigned = all(bool(agent.config.subtask_domain) for agent in self.agents.values())
+        if all_assigned:
+            return
+        
+        # Simple grid partitioning
+        grid_width, grid_height = self.config.grid_size
+        num_agents = len(self.agents)
+        
+        # Determine partitioning strategy (try to make square-ish partitions)
+        partitions_x = int(np.ceil(np.sqrt(num_agents)))
+        partitions_y = int(np.ceil(num_agents / partitions_x))
+        
+        width_per_partition = grid_width // partitions_x
+        height_per_partition = grid_height // partitions_y
+        
+        # Assign domains to agents
+        agent_list = list(self.agents.values())
+        partition_idx = 0
+        
+        for i in range(partitions_x):
+            for j in range(partitions_y):
+                if partition_idx < num_agents:
+                    x_start = i * width_per_partition
+                    y_start = j * height_per_partition
+                    x_end = min((i + 1) * width_per_partition, grid_width)
+                    y_end = min((j + 1) * height_per_partition, grid_height)
+                    
+                    # Create domain as list of coordinates
+                    domain = []
+                    for x in range(x_start, x_end):
+                        for y in range(y_start, y_end):
+                            domain.append((x, y))
+                    
+                    agent_list[partition_idx].config.subtask_domain = domain
+                    logger.info(f"Assigned domain to agent {agent_list[partition_idx].id}: {x_start}:{x_end}, {y_start}:{y_end}")
+                    
+                    partition_idx += 1
+    
+    async def train(self, environment, num_episodes: int, q_value_map: Optional[Dict] = None):
+        """
+        Train the multi-agent system on the given environment.
+        
+        Args:
+            environment: Environment that supports reset() and step(action) methods
+            num_episodes: Number of episodes to train for
+            q_value_map: Initial Q-values to guide exploration (optional)
+        """
+        pathfinder = None
+        if q_value_map:
+            # Initialize pathfinder with Q-values for heuristic guidance
+            pathfinder = AStarPathfinder(
+                q_values=q_value_map,
+                config=self.pathfinder_config
+            )
+        
+        for episode in range(num_episodes):
+            await self._run_episode(environment, episode, pathfinder)
+            
+            # Coordinate agents periodically
+            if episode % self.config.coordination_frequency == 0:
+                await self._coordinate_agents()
+            
+            self._episode_counter = episode
+            
+            # Log progress
+            if episode % 10 == 0:
+                logger.info(f"Completed episode {episode}/{num_episodes}")
+        
+        logger.info(f"Training completed after {num_episodes} episodes")
+    
+    async def _run_episode(self, environment, episode: int, pathfinder: Optional[AStarPathfinder] = None):
+        """
+        Run a single training episode with all agents participating.
+        """
+        state = environment.reset()
+        done = False
+        total_reward = 0
+        
+        # Determine goal state for this episode (assuming environment has a goal)
+        goal = getattr(environment, 'goal', None)
+        
+        # Use A* pathfinder to find optimal path if available
+        optimal_path = None
+        if pathfinder and goal:
+            optimal_path, _ = await pathfinder.bidirectional_a_star(state, goal)
+            
+            # Share optimal path with agents for guided exploration
+            if optimal_path:
+                path_reward = 1.0  # Reward for following optimal path
+                await asyncio.gather(*[
+                    self._learning_executor.submit(
+                        agent.incorporate_pathfinder_data, 
+                        optimal_path, goal, path_reward
+                    ) 
+                    for agent in self.agents.values()
+                ])
+        
+        # Track steps in this episode
+        step = 0
+        max_steps = self.config.agents_config[0].q_learning_config.max_steps
+        
+        while not done and step < max_steps:
+            # Get responsible agent for current state
+            responsible_agent = self._get_responsible_agent(state)
+            
+            # Let the agent select an action
+            action = responsible_agent.select_action(state)
+            
+            # Take action in environment
+            next_state, reward, done, info = environment.step(action)
+            
+            # Create experience
+            experience = Experience(
+                state=state,
+                action=action,
+                reward=reward,
+                next_state=next_state,
+                done=done
+            )
+            
+            # Update the responsible agent
+            await self._learning_executor.submit(responsible_agent.process_experiences, [experience])
+            
+            # Share valuable experience with other agents if reward is significant
+            if reward > self.config.experience_sharing_threshold:
+                await self._share_experience(experience)
+            
+            state = next_state
+            total_reward += reward
+            step += 1
+            
+            # Process messages periodically
+            if step % 5 == 0:
+                await self._process_all_messages()
+        
+        # Track episode completion for all agents
+        await asyncio.gather(*[
+            self._learning_executor.submit(agent.track_episode)
+            for agent in self.agents.values()
+        ])
+        
+        logger.debug(f"Episode {episode} completed with reward {total_reward}")
+        return total_reward
+    
+    def _get_responsible_agent(self, state: Tuple[int, int]) -> QAgent:
+        """
+        Determine which agent is responsible for the given state.
+        """
+        for agent in self.agents.values():
+            if agent._is_in_domain(state):
+                return agent
+        
+        # If no agent claims the state, return the first agent as default
+        logger.warning(f"No agent responsible for state {state}, using default")
+        return next(iter(self.agents.values()))
+    
+    async def _share_experience(self, experience: Experience):
+        """
+        Share a valuable experience with all agents.
+        """
+        for agent in self.agents.values():
+            # Skip the experience if it's not in or adjacent to the agent's domain
+            if not (agent._is_in_domain(experience.state) or agent._is_in_domain(experience.next_state)):
+                continue
+            
+            # Share the experience
+            message = {
+                'type': 'experience',
+                'sender_id': 'coordinator',
+                'experiences': [experience.dict()]
+            }
+            await self._thread_executor.submit(agent.receive_message, message)
+    
+    async def _process_all_messages(self):
+        """
+        Process all pending messages for all agents.
+        """
+        await asyncio.gather(*[
+            self._thread_executor.submit(agent.process_messages)
+            for agent in self.agents.values()
+        ])
+    
+    async def _coordinate_agents(self):
+        """
+        Perform coordination activities between agents.
+        """
+        # Share Q-values between agents for overlapping areas
+        await self._share_q_values()
+        
+        # Check for load balancing opportunities
+        await self._balance_agent_loads()
+    
+    async def _share_q_values(self):
+        """
+        Share Q-values between agents for overlapping or boundary states.
+        """
+        # Identify boundary states between agents
+        boundary_states = self._identify_boundary_states()
+        
+        # Have each agent share its Q-values for boundary states
+        for agent_id, states in boundary_states.items():
+            agent = self.agents[agent_id]
+            q_values_message = await self._thread_executor.submit(agent.share_q_values, states)
+            
+            # Share with relevant agents
+            for other_agent in self.agents.values():
+                if other_agent.id != agent_id:
+                    await self._thread_executor.submit(other_agent.receive_message, q_values_message)
+    
+    def _identify_boundary_states(self) -> Dict[str, List[Tuple[int, int]]]:
+        """
+        Identify boundary states between agent domains.
+        """
+        boundary_states = {agent_id: [] for agent_id in self.agents.keys()}
+        
+        # For each agent, find states that are at the boundary of its domain
+        for agent_id, agent in self.agents.items():
+            if not agent.config.subtask_domain:
+                continue
+                
+            # For each state in the domain
+            for state in agent.config.subtask_domain:
+                x, y = state
+                
+                # Check neighboring states
+                for dx in [-1, 0, 1]:
+                    for dy in [-1, 0, 1]:
+                        if dx == 0 and dy == 0:
+                            continue
+                        
+                        neighbor = (x + dx, y + dy)
+                        
+                        # If neighbor is valid but not in domain, this is a boundary
+                        if (0 <= neighbor[0] < self.config.grid_size[0] and 
+                            0 <= neighbor[1] < self.config.grid_size[1] and 
+                            neighbor not in agent.config.subtask_domain):
+                            
+                            boundary_states[agent_id].append(state)
+                            break
+        
+        return boundary_states
+    
+    async def _balance_agent_loads(self):
+        """
+        Balance the workload between agents by reassigning parts of domains.
+        """
+        # Calculate the load on each agent (could be based on domain size, visit frequency, etc.)
+        agent_loads = {}
+        for agent_id, agent in self.agents.items():
+            # Simple metric: domain size
+            agent_loads[agent_id] = len(agent.config.subtask_domain) if agent.config.subtask_domain else 0
+        
+        # Find imbalances
+        avg_load = sum(agent_loads.values()) / len(agent_loads)
+        overloaded = []
+        underloaded = []
+        
+        for agent_id, load in agent_loads.items():
+            # Consider an agent overloaded/underloaded if 20% above/below average
+            if load > avg_load * 1.2:
+                overloaded.append((agent_id, load))
+            elif load < avg_load * 0.8 and load > 0:  # Ensure agent has some load
+                underloaded.append((agent_id, load))
+        
+        # Balance by transferring states from overloaded to underloaded agents
+        if overloaded and underloaded:
+            # Sort by load (descending for overloaded, ascending for underloaded)
+            overloaded.sort(key=lambda x: x[1], reverse=True)
+            underloaded.sort(key=lambda x: x[1])
+            
+            for over_id, _ in overloaded:
+                for under_id, _ in underloaded:
+                    over_agent = self.agents[over_id]
+                    under_agent = self.agents[under_id]
+                    
+                    # Find transferable states (boundary states in overloaded agent's domain)
+                    transferable = self._find_transferable_states(over_agent, under_agent)
+                    
+                    if transferable:
+                        # Transfer a portion of states
+                        transfer_count = min(len(transferable) // 4, 
+                                        int((agent_loads[over_id] - agent_loads[under_id]) // 2))
+                        transfer_count = max(1, transfer_count)  # Transfer at least one state
+                        
+                        states_to_transfer = transferable[:transfer_count]
+                        
+                        # Update domains
+                        over_agent.config.subtask_domain = [
+                            state for state in over_agent.config.subtask_domain 
+                            if state not in states_to_transfer
+                        ]
+                        under_agent.config.subtask_domain.extend(states_to_transfer)
+                        
+                        # Notify agents of the change
+                        await self._notify_domain_change(over_id, under_id, states_to_transfer)
+                        
+                        logger.info(f"Transferred {len(states_to_transfer)} states from agent {over_id} to {under_id}")
+                        
+                        # Update loads for next iteration
+                        agent_loads[over_id] -= len(states_to_transfer)
+                        agent_loads[under_id] += len(states_to_transfer)
+    
+    def _find_transferable_states(self, over_agent: QAgent, under_agent: QAgent) -> List[Tuple[int, int]]:
+        """
+        Find states that can be transferred from overloaded to underloaded agent.
+        """
+        if not over_agent.config.subtask_domain:
+            return []
+        
+        # Find boundary states in overloaded agent's domain that are adjacent to underloaded agent
+        transferable = []
+        under_domain = set(under_agent.config.subtask_domain) if under_agent.config.subtask_domain else set()
+        
+        for state in over_agent.config.subtask_domain:
+            x, y = state
+            
+            # Check if this state is at the boundary
+            is_boundary = False
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    if dx == 0 and dy == 0:
+                        continue
+                    
+                    neighbor = (x + dx, y + dy)
+                    if neighbor in under_domain:
+                        is_boundary = True
+                        break
+                
+                if is_boundary:
+                    break
+            
+            if is_boundary:
+                transferable.append(state)
+        
+        return transferable
+    
+    async def _notify_domain_change(self, from_agent_id: str, to_agent_id: str, states: List[Tuple[int, int]]):
+        """
+        Notify agents of domain changes.
+        """
+        # Notify the agent losing domain
+        message_from = {
+            'type': 'coordination',
+            'coordination_type': 'task_reassignment',
+            'new_domain': self.agents[from_agent_id].config.subtask_domain
+        }
+        await self._thread_executor.submit(self.agents[from_agent_id].receive_message, message_from)
+        
+        # Notify the agent gaining domain
+        message_to = {
+            'type': 'coordination',
+            'coordination_type': 'task_reassignment',
+            'new_domain': self.agents[to_agent_id].config.subtask_domain
+        }
+        await self._thread_executor.submit(self.agents[to_agent_id].receive_message, message_to)
+    
+    def get_consolidated_q_table(self) -> np.ndarray:
+        """
+        Get a consolidated Q-table combining knowledge from all agents.
+        """
+        consolidated = np.zeros((
+            self.config.grid_size[0],
+            self.config.grid_size[1],
+            self.config.action_space
+        ), dtype=np.float32)
+        
+        # For each state, find the responsible agent and use its Q-values
+        for x in range(self.config.grid_size[0]):
+            for y in range(self.config.grid_size[1]):
+                state = (x, y)
+                responsible_agent = self._get_responsible_agent(state)
+                consolidated[x, y, :] = responsible_agent.q_table[x, y, :]
+        
+        return consolidated
+    
+    def save_q_tables(self, save_path: str):
+        """
+        Save all agent Q-tables to disk.
+        """
+        import os
+        import pickle
+        
+        os.makedirs(save_path, exist_ok=True)
+        
+        # Save individual agent Q-tables
+        for agent_id, agent in self.agents.items():
+            agent_path = os.path.join(save_path, f"agent_{agent_id}_q_table.pkl")
+            with open(agent_path, 'wb') as f:
+                pickle.dump(agent.q_table, f)
+        
+        # Save consolidated Q-table
+        consolidated_path = os.path.join(save_path, "consolidated_q_table.pkl")
+        with open(consolidated_path, 'wb') as f:
+            pickle.dump(self.get_consolidated_q_table(), f)
+        
+        logger.info(f"Saved Q-tables to {save_path}")
+    
+    def load_q_tables(self, load_path: str):
+        """
+        Load agent Q-tables from disk.
+        """
+        import os
+        import pickle
+        
+        # Load individual agent Q-tables
+        for agent_id, agent in self.agents.items():
+            agent_path = os.path.join(load_path, f"agent_{agent_id}_q_table.pkl")
+            if os.path.exists(agent_path):
+                with open(agent_path, 'rb') as f:
+                    agent.q_table = pickle.load(f)
+                # Copy to target network if using double Q-learning
+                if agent.config.use_double_q:
+                    agent.target_q_table = np.copy(agent.q_table)
+                logger.info(f"Loaded Q-table for agent {agent_id}")
+    
+    async def select_action(self, state: Tuple[int, int]) -> int:
+        """
+        Select an action for the given state using the responsible agent.
+        """
+        agent = self._get_responsible_agent(state)
+        return agent.select_action(state)
+    
+    def close(self):
+        """
+        Clean up resources.
+        """
+        self._thread_executor.shutdown()
+        self._learning_executor.shutdown()
+
+class HierarchicalMultiAgentEnvironment:
+    """
+    A wrapper environment that supports the hierarchical multi-agent system.
+    This environment can be customized depending on the specific problem domain.
+    """
+    def __init__(self, grid_size: Tuple[int, int], obstacles: List[Tuple[int, int]] = None):
+        self.grid_size = grid_size
+        self.obstacles = obstacles or []
+        self.agent_pos = (0, 0)
+        self.goal = (grid_size[0] - 1, grid_size[1] - 1)
+        self.done = False
+        self.max_steps = grid_size[0] * grid_size[1]  # A reasonable upper bound
+        self.current_step = 0
+    
+    def reset(self) -> Tuple[int, int]:
+        """
+        Reset the environment to initial state.
+        """
+        self.agent_pos = (0, 0)
+        self.done = False
+        self.current_step = 0
+        return self.agent_pos
+    
+    def step(self, action: int) -> Tuple[Tuple[int, int], float, bool, Dict]:
+        """
+        Take an action in the environment.
+        
+        Args:
+            action: Integer representing the action (0-7 for 8-directional movement)
+            
+        Returns:
+            next_state: The new agent position
+            reward: The reward for this step
+            done: Whether the episode is done
+            info: Additional information
+        """
+        self.current_step += 1
+        
+        # Map action to direction
+        directions = [
+            (1, 0), (-1, 0), (0, 1), (0, -1),  # Cardinal directions
+            (1, 1), (1, -1), (-1, 1), (-1, -1)  # Diagonal directions
+        ]
+        
+        if action < len(directions):
+            dx, dy = directions[action]
+            next_x = self.agent_pos[0] + dx
+            next_y = self.agent_pos[1] + dy
+            
+            # Check bounds
+            if (0 <= next_x < self.grid_size[0] and 
+                0 <= next_y < self.grid_size[1] and 
+                (next_x, next_y) not in self.obstacles):
+                self.agent_pos = (next_x, next_y)
+        
+        # Calculate reward
+        if self.agent_pos == self.goal:
+            reward = 10.0
+            self.done = True
+        else:
+            # Negative reward based on distance to goal (encourages finding shortest path)
+            dist_to_goal = np.sqrt((self.agent_pos[0] - self.goal[0])**2 + 
+                                 (self.agent_pos[1] - self.goal[1])**2)
+            reward = -0.1 - 0.01 * dist_to_goal
+        
+        # Check if we've reached maximum steps
+        if self.current_step >= self.max_steps:
+            self.done = True
+        
+        return self.agent_pos, reward, self.done, {}
+    
+    def render(self):
+        """
+        Render the environment (text-based for simplicity).
+        """
+        grid = []
+        for y in range(self.grid_size[1]):
+            row = []
+            for x in range(self.grid_size[0]):
+                if (x, y) == self.agent_pos:
+                    row.append('A')
+                elif (x, y) == self.goal:
+                    row.append('G')
+                elif (x, y) in self.obstacles:
+                    row.append('#')
+                else:
+                    row.append('.')
+            grid.append(''.join(row))
+        
+        return '\n'.join(grid)
+
+
+async def main():
+    """
+    Example of how to use the hierarchical multi-agent system.
+    """
+    # Define grid world
+    grid_size = (20, 20)
+    obstacles = [(5, 5), (5, 6), (5, 7), (5, 8), (15, 10), (15, 11), (15, 12), (15, 13)]
+    
+    # Create agents configuration
+    agents_config = [
+        AgentConfig(
+            agent_id=f"agent_{i}",
+            q_learning_config=QLearningParams(
+                state_space=grid_size,
+                action_space=8,
+                alpha=0.1,
+                gamma=0.99,
+                epsilon=1.0,
+                epsilon_min=0.01,
+                epsilon_decay=0.995,
+                exploration_strategy="epsilon_greedy"
+            )
+        ) for i in range(4)  # Create 4 agents
+    ]
+    
+    # System configuration
+    system_config = HierarchicalAgentSystemConfig(
+        agents_config=agents_config,
+        grid_size=grid_size,
+        action_space=8,
+        pathfinder_config=PathfinderConfig(
+            grid_size=grid_size,
+            allow_diagonal=True
+        ),
+        max_communication_threads=4,
+        max_learning_threads=4
+    )
+    
+    # Initialize environment
+    env = HierarchicalMultiAgentEnvironment(grid_size, obstacles)
+    
+    # Initialize hierarchical agent system
+    system = HierarchicalAgentSystem(system_config)
+    
+    # Train the system
+    print("Starting training...")
+    await system.train(env, num_episodes=1000)
+    
+    # Save the trained model
+    system.save_q_tables("./trained_models")
+    
+    # Test the trained system
+    print("Testing trained system...")
+    env.reset()
+    state = env.agent_pos
+    done = False
+    total_reward = 0
+    
+    while not done:
+        action = await system.select_action(state)
+        next_state, reward, done, _ = env.step(action)
+        total_reward += reward
+        state = next_state
+        
+        print(env.render())
+        print(f"Action: {action}, Reward: {reward:.2f}, Total: {total_reward:.2f}")
+        
+        # Small delay to visualize
+        await asyncio.sleep(0.5)
+    
+    print(f"Final total reward: {total_reward:.2f}")
+    
+    # Clean up
+    system.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
